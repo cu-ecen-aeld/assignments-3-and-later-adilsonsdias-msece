@@ -70,7 +70,7 @@ else
 fi
 
 make ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE}
-make ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} CONFIG_PREFIX+${OUTDIR}/rootfs install
+make ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} CONFIG_PREFIX=${OUTDIR}/rootfs install
 cd ${OUTDIR}/rootfs
 
 echo "Library dependencies"
@@ -82,12 +82,12 @@ SYSROOT=$(${CROSS_COMPILE}gcc -print-sysroot)
 cp -L ${SYSROOT}/lib/ld-linux-aarch64.so.1 ${OUTDIR}/rootfs/lib/
 
 if [ -d "${SYSROOT}/lib64" ]; then
-    echo "Копируем библиотеки из sysroot/lib64"
+    echo "copy sysroot/lib64"
     cp -L ${SYSROOT}/lib64/libm.so.6 ${OUTDIR}/rootfs/lib64/
     cp -L ${SYSROOT}/lib64/libc.so.6 ${OUTDIR}/rootfs/lib64/
     cp -L ${SYSROOT}/lib64/libresolv.so.2 ${OUTDIR}/rootfs/lib64/
 else
-    echo "Папка lib64 не найдена в sysroot. Копируем библиотеки из sysroot/lib"
+    echo "Folder lib64 not found in sysroot. Copying libraries from sysroot/lib"
     cp -L ${SYSROOT}/lib/libm.so.6 ${OUTDIR}/rootfs/lib64/
     cp -L ${SYSROOT}/lib/libc.so.6 ${OUTDIR}/rootfs/lib64/
     cp -L ${SYSROOT}/lib/libresolv.so.2 ${OUTDIR}/rootfs/lib64/
@@ -102,7 +102,7 @@ cd ${FINDER_APP_DIR}
     make CROSS_COMPILE=${CROSS_COMPILE}
 # TODO: Copy the finder related scripts and executables to the /home directory
 # on the target rootfs
-# Копируем все исполняемые файлы и скрипты в /home нашей целевой системы
+# Copying all executable files and scripts to /home of our target system
     cp ${FINDER_APP_DIR}/writer ${OUTDIR}/rootfs/home/
     cp ${FINDER_APP_DIR}/finder.sh ${OUTDIR}/rootfs/home/
     cp ${FINDER_APP_DIR}/finder-test.sh ${OUTDIR}/rootfs/home/

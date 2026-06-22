@@ -15,18 +15,37 @@
 #include <time.h>
 #include <unistd.h>
 
+#ifndef USE_AESD_CHAR_DEVICE
+#define USE_AESD_CHAR_DEVICE 1
+#endif
+
+#if USE_AESD_CHAR_DEVICE
+#include <sys/ioctl.h>
+#include "../aesd-char-driver/aesd_ioctl.h"
+#endif
+
 #define PORT 9000
-#define DATA_FILE "/var/tmp/aesdsocketdata"
+#if USE_AESD_CHAR_DEVICE
+#define DATA_PATH "/dev/aesdchar"
+#else
+#define DATA_PATH "/var/tmp/aesdsocketdata"
+#endif
 #define RECV_BUF_SIZE 1024
 #define SEND_BUF_SIZE 4096
 #define PACKET_INIT_SIZE 128
+#if !USE_AESD_CHAR_DEVICE
 #define TIMESTAMP_INTERVAL_SEC 10
 #define RFC2822_FMT "%a, %d %b %Y %H:%M:%S %z"
+#endif
 
 static volatile sig_atomic_t exit_requested = 0;
 
 static pthread_mutex_t file_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t thread_list_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+#if USE_AESD_CHAR_DEVICE
+static int data_fd = -1;
+#endif
 
 struct thread_entry {
     pthread_t thread_id;
@@ -127,29 +146,79 @@ static int setup_server_socket(void)
     return server_fd;
 }
 
+#if USE_AESD_CHAR_DEVICE
+static int open_data_fd(void)
+{
+    if (data_fd < 0) {
+        data_fd = open(DATA_PATH, O_RDWR);
+        if (data_fd < 0) {
+            syslog(LOG_ERR, "Failed to open %s: %s", DATA_PATH, strerror(errno));
+        }
+    }
+    return data_fd;
+}
+#endif
+
 static int append_data_to_file_unlocked(const char *data, size_t data_len)
 {
     int fd;
     ssize_t written = 0;
 
-    fd = open(DATA_FILE, O_WRONLY | O_CREAT | O_APPEND, 0644);
+#if USE_AESD_CHAR_DEVICE
+    fd = open_data_fd();
     if (fd < 0) {
-        syslog(LOG_ERR, "Failed to open %s: %s", DATA_FILE, strerror(errno));
         return -1;
     }
+#else
+    fd = open(DATA_PATH, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd < 0) {
+        syslog(LOG_ERR, "Failed to open %s: %s", DATA_PATH, strerror(errno));
+        return -1;
+    }
+#endif
 
     while (written < (ssize_t)data_len) {
         ssize_t rc = write(fd, data + written, data_len - (size_t)written);
         if (rc < 0) {
-            syslog(LOG_ERR, "Failed to write to %s: %s", DATA_FILE, strerror(errno));
+            syslog(LOG_ERR, "Failed to write to %s: %s", DATA_PATH, strerror(errno));
+#if !USE_AESD_CHAR_DEVICE
             close(fd);
+#endif
             return -1;
         }
         written += rc;
     }
 
+#if !USE_AESD_CHAR_DEVICE
     if (close(fd) < 0) {
-        syslog(LOG_ERR, "Failed to close %s: %s", DATA_FILE, strerror(errno));
+        syslog(LOG_ERR, "Failed to close %s: %s", DATA_PATH, strerror(errno));
+        return -1;
+    }
+#endif
+
+    return 0;
+}
+
+static int send_data_from_fd_unlocked(int client_fd, int file_fd)
+{
+    char send_buf[SEND_BUF_SIZE];
+    ssize_t bytes_read;
+
+    while ((bytes_read = read(file_fd, send_buf, sizeof(send_buf))) > 0) {
+        ssize_t sent = 0;
+
+        while (sent < bytes_read) {
+            ssize_t rc = send(client_fd, send_buf + sent, (size_t)(bytes_read - sent), 0);
+            if (rc < 0) {
+                syslog(LOG_ERR, "Failed to send file contents: %s", strerror(errno));
+                return -1;
+            }
+            sent += rc;
+        }
+    }
+
+    if (bytes_read < 0) {
+        syslog(LOG_ERR, "Failed to read from data source: %s", strerror(errno));
         return -1;
     }
 
@@ -159,46 +228,74 @@ static int append_data_to_file_unlocked(const char *data, size_t data_len)
 static int send_file_to_client_unlocked(int client_fd)
 {
     int file_fd;
-    char send_buf[SEND_BUF_SIZE];
-    ssize_t bytes_read;
 
-    file_fd = open(DATA_FILE, O_RDONLY);
+#if USE_AESD_CHAR_DEVICE
+    file_fd = open_data_fd();
+    if (file_fd < 0) {
+        return -1;
+    }
+    if (lseek(file_fd, 0, SEEK_SET) < 0) {
+        syslog(LOG_ERR, "Failed to seek %s: %s", DATA_PATH, strerror(errno));
+        return -1;
+    }
+    return send_data_from_fd_unlocked(client_fd, file_fd);
+#else
+    file_fd = open(DATA_PATH, O_RDONLY);
     if (file_fd < 0) {
         if (errno == ENOENT) {
             return 0;
         }
-        syslog(LOG_ERR, "Failed to open %s for reading: %s", DATA_FILE, strerror(errno));
+        syslog(LOG_ERR, "Failed to open %s for reading: %s", DATA_PATH, strerror(errno));
         return -1;
     }
 
-    while ((bytes_read = read(file_fd, send_buf, sizeof(send_buf))) > 0) {
-        ssize_t sent = 0;
-
-        while (sent < bytes_read) {
-            ssize_t rc = send(client_fd, send_buf + sent, (size_t)(bytes_read - sent), 0);
-            if (rc < 0) {
-                syslog(LOG_ERR, "Failed to send file contents: %s", strerror(errno));
-                close(file_fd);
-                return -1;
-            }
-            sent += rc;
-        }
-    }
-
-    if (bytes_read < 0) {
-        syslog(LOG_ERR, "Failed to read %s: %s", DATA_FILE, strerror(errno));
+    if (send_data_from_fd_unlocked(client_fd, file_fd) < 0) {
         close(file_fd);
         return -1;
     }
 
     if (close(file_fd) < 0) {
-        syslog(LOG_ERR, "Failed to close %s: %s", DATA_FILE, strerror(errno));
+        syslog(LOG_ERR, "Failed to close %s: %s", DATA_PATH, strerror(errno));
         return -1;
     }
 
     return 0;
+#endif
 }
 
+#if USE_AESD_CHAR_DEVICE
+static int handle_seek_ioctl_packet(int client_fd, const char *packet_buf, size_t packet_len)
+{
+    unsigned int write_cmd;
+    unsigned int write_cmd_offset;
+    struct aesd_seekto seekto;
+    int fd;
+
+    (void)packet_len;
+
+    if (sscanf(packet_buf, "AESDCHAR_IOCSEEKTO:%u,%u", &write_cmd, &write_cmd_offset) != 2) {
+        syslog(LOG_ERR, "Failed to parse seek ioctl packet");
+        return -1;
+    }
+
+    fd = open_data_fd();
+    if (fd < 0) {
+        return -1;
+    }
+
+    seekto.write_cmd = write_cmd;
+    seekto.write_cmd_offset = write_cmd_offset;
+
+    if (ioctl(fd, AESDCHAR_IOCSEEKTO, &seekto) < 0) {
+        syslog(LOG_ERR, "AESDCHAR_IOCSEEKTO failed: %s", strerror(errno));
+        return -1;
+    }
+
+    return send_data_from_fd_unlocked(client_fd, fd);
+}
+#endif
+
+#if !USE_AESD_CHAR_DEVICE
 static int append_timestamp_unlocked(void)
 {
     char time_buf[64];
@@ -225,6 +322,7 @@ static int append_timestamp_unlocked(void)
     line_len = (size_t)snprintf(line, sizeof(line), "timestamp:%s\n", time_buf);
     return append_data_to_file_unlocked(line, line_len);
 }
+#endif
 
 static int append_char_to_packet(char **packet_buf, size_t *packet_len, size_t *packet_cap, char ch)
 {
@@ -255,6 +353,15 @@ static int process_complete_packet(int client_fd, char *packet_buf, size_t packe
         return 0;
     }
 
+#if USE_AESD_CHAR_DEVICE
+    if (strncmp(packet_buf, "AESDCHAR_IOCSEEKTO:", 19) == 0) {
+        pthread_mutex_lock(&file_mutex);
+        rc = handle_seek_ioctl_packet(client_fd, packet_buf, packet_len);
+        pthread_mutex_unlock(&file_mutex);
+        return rc;
+    }
+#endif
+
     pthread_mutex_lock(&file_mutex);
     if (append_data_to_file_unlocked(packet_buf, packet_len) == 0) {
         rc = send_file_to_client_unlocked(client_fd);
@@ -266,6 +373,7 @@ static int process_complete_packet(int client_fd, char *packet_buf, size_t packe
     return rc;
 }
 
+#if !USE_AESD_CHAR_DEVICE
 static void *timer_thread_func(void *arg)
 {
     int i;
@@ -287,6 +395,7 @@ static void *timer_thread_func(void *arg)
 
     return NULL;
 }
+#endif
 
 static void *connection_thread_func(void *arg)
 {
@@ -428,6 +537,7 @@ static int start_connection_thread(int client_fd, const char *client_ip)
     return 0;
 }
 
+#if !USE_AESD_CHAR_DEVICE
 static int start_timer_thread(void)
 {
     pthread_t thread_id;
@@ -447,6 +557,7 @@ static int start_timer_thread(void)
 
     return 0;
 }
+#endif
 
 int main(int argc, char *argv[])
 {
@@ -488,11 +599,13 @@ int main(int argc, char *argv[])
         return -1;
     }
 
+#if !USE_AESD_CHAR_DEVICE
     if (start_timer_thread() < 0) {
         close(server_fd);
         closelog();
         return -1;
     }
+#endif
 
     while (!exit_requested) {
         struct sockaddr_in client_addr;
@@ -528,10 +641,16 @@ int main(int argc, char *argv[])
     close(server_fd);
     shutdown_active_connections();
     join_all_threads();
-    unlink(DATA_FILE);
+#if USE_AESD_CHAR_DEVICE
+    if (data_fd >= 0) {
+        close(data_fd);
+        data_fd = -1;
+    }
+#else
+    unlink(DATA_PATH);
+#endif
     syslog(LOG_INFO, "Caught signal, exiting");
     closelog();
 
     return 0;
 }
-

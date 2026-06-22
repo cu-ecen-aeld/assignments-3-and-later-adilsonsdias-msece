@@ -2,14 +2,17 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/queue.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <syslog.h>
+#include <time.h>
 #include <unistd.h>
 
 #define PORT 9000
@@ -17,8 +20,27 @@
 #define RECV_BUF_SIZE 1024
 #define SEND_BUF_SIZE 4096
 #define PACKET_INIT_SIZE 128
+#define TIMESTAMP_INTERVAL_SEC 10
+#define RFC2822_FMT "%a, %d %b %Y %H:%M:%S %z"
 
 static volatile sig_atomic_t exit_requested = 0;
+
+static pthread_mutex_t file_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t thread_list_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+struct thread_entry {
+    pthread_t thread_id;
+    int client_fd;
+    SLIST_ENTRY(thread_entry) entries;
+};
+
+SLIST_HEAD(thread_list, thread_entry);
+static struct thread_list active_threads = SLIST_HEAD_INITIALIZER(active_threads);
+
+struct connection_info {
+    int client_fd;
+    char client_ip[INET_ADDRSTRLEN];
+};
 
 static int become_daemon(void)
 {
@@ -97,7 +119,7 @@ static int setup_server_socket(void)
         return -1;
     }
 
-    if (listen(server_fd, 5) < 0) {
+    if (listen(server_fd, 16) < 0) {
         close(server_fd);
         return -1;
     }
@@ -105,7 +127,7 @@ static int setup_server_socket(void)
     return server_fd;
 }
 
-static int append_packet_to_file(const char *packet, size_t packet_len)
+static int append_data_to_file_unlocked(const char *data, size_t data_len)
 {
     int fd;
     ssize_t written = 0;
@@ -116,8 +138,8 @@ static int append_packet_to_file(const char *packet, size_t packet_len)
         return -1;
     }
 
-    while (written < (ssize_t)packet_len) {
-        ssize_t rc = write(fd, packet + written, packet_len - (size_t)written);
+    while (written < (ssize_t)data_len) {
+        ssize_t rc = write(fd, data + written, data_len - (size_t)written);
         if (rc < 0) {
             syslog(LOG_ERR, "Failed to write to %s: %s", DATA_FILE, strerror(errno));
             close(fd);
@@ -134,7 +156,7 @@ static int append_packet_to_file(const char *packet, size_t packet_len)
     return 0;
 }
 
-static int send_file_to_client(int client_fd)
+static int send_file_to_client_unlocked(int client_fd)
 {
     int file_fd;
     char send_buf[SEND_BUF_SIZE];
@@ -177,6 +199,33 @@ static int send_file_to_client(int client_fd)
     return 0;
 }
 
+static int append_timestamp_unlocked(void)
+{
+    char time_buf[64];
+    char line[128];
+    struct timespec ts;
+    struct tm tm_info;
+    size_t line_len;
+
+    if (clock_gettime(CLOCK_REALTIME, &ts) != 0) {
+        syslog(LOG_ERR, "clock_gettime failed: %s", strerror(errno));
+        return -1;
+    }
+
+    if (localtime_r(&ts.tv_sec, &tm_info) == NULL) {
+        syslog(LOG_ERR, "localtime_r failed: %s", strerror(errno));
+        return -1;
+    }
+
+    if (strftime(time_buf, sizeof(time_buf), RFC2822_FMT, &tm_info) == 0) {
+        syslog(LOG_ERR, "strftime failed to format timestamp");
+        return -1;
+    }
+
+    line_len = (size_t)snprintf(line, sizeof(line), "timestamp:%s\n", time_buf);
+    return append_data_to_file_unlocked(line, line_len);
+}
+
 static int append_char_to_packet(char **packet_buf, size_t *packet_len, size_t *packet_cap, char ch)
 {
     if (*packet_len + 1 > *packet_cap) {
@@ -198,25 +247,62 @@ static int append_char_to_packet(char **packet_buf, size_t *packet_len, size_t *
     return 0;
 }
 
-static void process_complete_packet(int client_fd, char *packet_buf, size_t packet_len)
+static int process_complete_packet(int client_fd, char *packet_buf, size_t packet_len)
 {
+    int rc = 0;
+
     if (packet_len == 0) {
-        return;
+        return 0;
     }
 
-    if (append_packet_to_file(packet_buf, packet_len) == 0) {
-        send_file_to_client(client_fd);
+    pthread_mutex_lock(&file_mutex);
+    if (append_data_to_file_unlocked(packet_buf, packet_len) == 0) {
+        rc = send_file_to_client_unlocked(client_fd);
+    } else {
+        rc = -1;
     }
+    pthread_mutex_unlock(&file_mutex);
+
+    return rc;
 }
 
-static void handle_client(int client_fd)
+static void *timer_thread_func(void *arg)
 {
+    int i;
+
+    (void)arg;
+
+    while (!exit_requested) {
+        for (i = 0; i < TIMESTAMP_INTERVAL_SEC && !exit_requested; i++) {
+            sleep(1);
+        }
+        if (exit_requested) {
+            break;
+        }
+
+        pthread_mutex_lock(&file_mutex);
+        append_timestamp_unlocked();
+        pthread_mutex_unlock(&file_mutex);
+    }
+
+    return NULL;
+}
+
+static void *connection_thread_func(void *arg)
+{
+    struct connection_info *info = arg;
+    int client_fd = info->client_fd;
+    char client_ip[INET_ADDRSTRLEN];
     char recv_buf[RECV_BUF_SIZE];
     char *packet_buf = NULL;
     size_t packet_len = 0;
     size_t packet_cap = 0;
     ssize_t bytes_received;
     size_t i;
+
+    strncpy(client_ip, info->client_ip, sizeof(client_ip));
+    client_ip[sizeof(client_ip) - 1] = '\0';
+    free(info);
 
     while (!exit_requested) {
         bytes_received = recv(client_fd, recv_buf, sizeof(recv_buf), 0);
@@ -237,7 +323,12 @@ static void handle_client(int client_fd)
         for (i = 0; i < (size_t)bytes_received; i++) {
             if (recv_buf[i] == '\n') {
                 if (append_char_to_packet(&packet_buf, &packet_len, &packet_cap, '\n') == 0) {
-                    process_complete_packet(client_fd, packet_buf, packet_len);
+                    if (process_complete_packet(client_fd, packet_buf, packet_len) < 0) {
+                        free(packet_buf);
+                        syslog(LOG_INFO, "Closed connection from %s", client_ip);
+                        close(client_fd);
+                        return NULL;
+                    }
                 }
                 packet_len = 0;
             } else {
@@ -249,6 +340,112 @@ static void handle_client(int client_fd)
     }
 
     free(packet_buf);
+    syslog(LOG_INFO, "Closed connection from %s", client_ip);
+    close(client_fd);
+    return NULL;
+}
+
+static int add_thread_entry(pthread_t thread_id, int client_fd)
+{
+    struct thread_entry *entry = malloc(sizeof(*entry));
+
+    if (entry == NULL) {
+        syslog(LOG_ERR, "Failed to allocate thread entry");
+        return -1;
+    }
+
+    entry->thread_id = thread_id;
+    entry->client_fd = client_fd;
+
+    pthread_mutex_lock(&thread_list_mutex);
+    SLIST_INSERT_HEAD(&active_threads, entry, entries);
+    pthread_mutex_unlock(&thread_list_mutex);
+
+    return 0;
+}
+
+static void shutdown_active_connections(void)
+{
+    struct thread_entry *entry;
+
+    pthread_mutex_lock(&thread_list_mutex);
+    SLIST_FOREACH(entry, &active_threads, entries) {
+        if (entry->client_fd >= 0) {
+            shutdown(entry->client_fd, SHUT_RDWR);
+        }
+    }
+    pthread_mutex_unlock(&thread_list_mutex);
+}
+
+static void join_all_threads(void)
+{
+    struct thread_entry *entry;
+
+    while (1) {
+        pthread_mutex_lock(&thread_list_mutex);
+        entry = SLIST_FIRST(&active_threads);
+        if (entry == NULL) {
+            pthread_mutex_unlock(&thread_list_mutex);
+            break;
+        }
+        SLIST_REMOVE_HEAD(&active_threads, entries);
+        pthread_mutex_unlock(&thread_list_mutex);
+
+        pthread_join(entry->thread_id, NULL);
+        free(entry);
+    }
+}
+
+static int start_connection_thread(int client_fd, const char *client_ip)
+{
+    struct connection_info *info;
+    pthread_t thread_id;
+    int rc;
+
+    info = malloc(sizeof(*info));
+    if (info == NULL) {
+        syslog(LOG_ERR, "Failed to allocate connection info");
+        return -1;
+    }
+
+    info->client_fd = client_fd;
+    strncpy(info->client_ip, client_ip, sizeof(info->client_ip));
+    info->client_ip[sizeof(info->client_ip) - 1] = '\0';
+
+    rc = pthread_create(&thread_id, NULL, connection_thread_func, info);
+    if (rc != 0) {
+        syslog(LOG_ERR, "pthread_create failed: %s", strerror(rc));
+        free(info);
+        return -1;
+    }
+
+    if (add_thread_entry(thread_id, client_fd) < 0) {
+        shutdown(client_fd, SHUT_RDWR);
+        pthread_join(thread_id, NULL);
+        return -1;
+    }
+
+    return 0;
+}
+
+static int start_timer_thread(void)
+{
+    pthread_t thread_id;
+    int rc;
+
+    rc = pthread_create(&thread_id, NULL, timer_thread_func, NULL);
+    if (rc != 0) {
+        syslog(LOG_ERR, "Failed to create timer thread: %s", strerror(rc));
+        return -1;
+    }
+
+    if (add_thread_entry(thread_id, -1) < 0) {
+        exit_requested = 1;
+        pthread_join(thread_id, NULL);
+        return -1;
+    }
+
+    return 0;
 }
 
 int main(int argc, char *argv[])
@@ -291,6 +488,12 @@ int main(int argc, char *argv[])
         return -1;
     }
 
+    if (start_timer_thread() < 0) {
+        close(server_fd);
+        closelog();
+        return -1;
+    }
+
     while (!exit_requested) {
         struct sockaddr_in client_addr;
         socklen_t client_len = sizeof(client_addr);
@@ -315,15 +518,20 @@ int main(int argc, char *argv[])
         }
 
         syslog(LOG_INFO, "Accepted connection from %s", client_ip);
-        handle_client(client_fd);
-        syslog(LOG_INFO, "Closed connection from %s", client_ip);
-        close(client_fd);
+
+        if (start_connection_thread(client_fd, client_ip) < 0) {
+            syslog(LOG_INFO, "Closed connection from %s", client_ip);
+            close(client_fd);
+        }
     }
 
     close(server_fd);
+    shutdown_active_connections();
+    join_all_threads();
     unlink(DATA_FILE);
     syslog(LOG_INFO, "Caught signal, exiting");
     closelog();
 
     return 0;
 }
+
